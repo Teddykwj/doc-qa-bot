@@ -1,11 +1,11 @@
 """Basic smoke test for the RAG chain (requires Ollama running)."""
 import pytest
 
-from src.ingestion.embedder import get_embeddings
-from src.llm.chain import build_rag_chain
-from src.llm.ollama_client import get_llm
-from src.retrieval.retriever import get_retriever
-from src.retrieval.vectorstore import get_vectorstore
+from app.infrastructure.embedder import get_embeddings
+from app.domain.llm.chain import build_rag_chain
+from app.domain.llm.ollama_client import get_llm
+from app.domain.retrieval.retriever import get_retriever
+from app.infrastructure.vectorstore import get_vectorstore
 
 
 @pytest.mark.integration

@@ -1,0 +1,456 @@
+Skip to main content
+
+Join us May 13th & May 14th at Interrupt, the Agent Conference by LangChain. Buy tickets >
+
+Docs by LangChain home page![light logo](https://mintcdn.com/langchain-5e9cc07a/nQm-sjd_MByLhgeW/images/brand/langchain-docs-dark-blue.png?fit=max&auto=format&n=nQm-sjd_MByLhgeW&q=85&s=5babf1a1962208fd7eed942fa2432ecb)![dark logo](https://mintcdn.com/langchain-5e9cc07a/nQm-sjd_MByLhgeW/images/brand/langchain-docs-light-blue.png?fit=max&auto=format&n=nQm-sjd_MByLhgeW&q=85&s=0bcd2a1f2599ed228bcedf0f535b45b1)![https://mintlify.s3.us-west-1.amazonaws.com/langchain-5e9cc07a/images/brand/langchain-icon.png](https://mintlify.s3.us-west-1.amazonaws.com/langchain-5e9cc07a/images/brand/langchain-icon.png)Open source
+
+Search...
+
+⌘K
+
+Search...
+
+Navigation
+
+Test
+
+Agent Evals
+
+Deep AgentsLangChainLangGraphIntegrationsLearnReferenceContribute
+
+Python
+
+
+
+* Overview
+
+##### Get started
+
+* Install
+* Quickstart
+* Changelog
+* Philosophy
+
+##### Core components
+
+* Agents
+* Models
+* Messages
+* Tools
+* Short-term memory
+* Streaming
+* Structured output
+
+##### Middleware
+
+* Overview
+* Prebuilt middleware
+* Custom middleware
+
+##### Frontend
+
+* Overview
+* Patterns
+* Integrations
+
+##### Advanced usage
+
+* Guardrails
+* Runtime
+* Context engineering
+* Model Context Protocol (MCP)
+* Human-in-the-loop
+* Multi-agent
+* Retrieval
+* Long-term memory
+
+##### Agent development
+
+* LangSmith Studio
+* Test
+
+  + Overview
+  + Unit testing
+  + Integration testing
+  + Agent Evals
+* Agent Chat UI
+
+##### Deploy with LangSmith
+
+* Deployment
+* Observability
+
+On this page
+
+* Install AgentEvals
+* Trajectory match evaluator
+* LLM-as-judge evaluator
+* Async support
+* Run evals in LangSmith
+
+Agent development
+
+Test
+
+# Agent Evals
+
+Copy page
+
+Evaluate agent trajectories using deterministic matching or LLM-as-judge evaluators with AgentEvals and LangSmith.
+
+Copy page
+
+Evaluations (“evals”) measure how well your agent performs by assessing its execution trajectory, the sequence of messages and tool calls it produces. Unlike integration tests that verify basic correctness, evals score agent behavior against a reference or rubric, making them useful for catching regressions when you change prompts, tools, or models.
+An evaluator is a function that takes agent outputs (and optionally reference outputs) and returns a score:
+
+```
+def evaluator(*, outputs: dict, reference_outputs: dict):
+    output_messages = outputs["messages"]
+    reference_messages = reference_outputs["messages"]
+    score = compare_messages(output_messages, reference_messages)
+    return {"key": "evaluator_score", "score": score}
+```
+
+The `agentevals` package provides prebuilt evaluators for agent trajectories. You can evaluate by performing a **trajectory match** (deterministic comparison) or by using an **LLM judge** (qualitative assessment):
+
+| Approach | When to use |
+| --- | --- |
+| Trajectory match | You know the expected tool calls and want fast, deterministic, cost-free checks |
+| LLM-as-judge | You want to assess overall quality and reasoning without strict expectations |
+
+## ​ Install AgentEvals
+
+```
+pip install agentevals
+```
+
+Or, clone the AgentEvals repository directly.
+
+## ​ Trajectory match evaluator
+
+AgentEvals offers the `create_trajectory_match_evaluator` function to match your agent’s trajectory against a reference. There are four modes:
+
+| Mode | Description | Use case |
+| --- | --- | --- |
+| `strict` | Exact match of message structure and tool calls in the same order (message content can differ) | Testing specific sequences (e.g., policy lookup before authorization) |
+| `unordered` | Same message structure and tool calls as reference, but tool calls can happen in any order | Verifying information retrieval when order doesn’t matter |
+| `subset` | Agent calls only tools from reference (no extras) | Ensuring agent doesn’t exceed expected scope |
+| `superset` | Agent calls at least the reference tools (extras allowed) | Verifying minimum required actions are taken |
+
+The examples below share a common setup, an agent with a `get_weather` tool:
+
+```
+from langchain.agents import create_agent
+from langchain.tools import tool
+from langchain.messages import HumanMessage, AIMessage, ToolMessage
+from agentevals.trajectory.match import create_trajectory_match_evaluator
+
+
+@tool
+def get_weather(city: str):
+    """Get weather information for a city."""
+    return f"It's 75 degrees and sunny in {city}."
+
+agent = create_agent("claude-sonnet-4-6", tools=[get_weather])
+```
+
+Strict match
+
+The `strict` mode ensures trajectories contain identical messages in the same order with the same tool calls, though it allows for differences in message content. This is useful when you need to enforce a specific sequence of operations, such as requiring a policy lookup before authorizing an action.
+
+```
+evaluator = create_trajectory_match_evaluator(
+    trajectory_match_mode="strict",
+)
+
+def test_weather_tool_called_strict():
+    result = agent.invoke({
+        "messages": [HumanMessage(content="What's the weather in San Francisco?")]
+    })
+
+    reference_trajectory = [
+        HumanMessage(content="What's the weather in San Francisco?"),
+        AIMessage(content="", tool_calls=[
+            {"id": "call_1", "name": "get_weather", "args": {"city": "San Francisco"}}
+        ]),
+        ToolMessage(content="It's 75 degrees and sunny in San Francisco.", tool_call_id="call_1"),
+        AIMessage(content="The weather in San Francisco is 75 degrees and sunny."),
+    ]
+
+    evaluation = evaluator(
+        outputs=result["messages"],
+        reference_outputs=reference_trajectory
+    )
+    # {
+    #     'key': 'trajectory_strict_match',
+    #     'score': True,
+    #     'comment': None,
+    # }
+    assert evaluation["score"] is True
+```
+
+
+
+Unordered match
+
+The `unordered` mode allows the same tool calls in any order. This is helpful when you want to verify that specific information was retrieved but don’t care about the sequence. For example, an agent that checks both weather and events for a city with different tool calls.
+
+```
+@tool
+def get_events(city: str):
+    """Get events happening in a city."""
+    return f"Concert at the park in {city} tonight."
+
+agent = create_agent("claude-sonnet-4-6", tools=[get_weather, get_events])
+
+evaluator = create_trajectory_match_evaluator(
+    trajectory_match_mode="unordered",
+)
+
+def test_multiple_tools_any_order():
+    result = agent.invoke({
+        "messages": [HumanMessage(content="What's happening in SF today?")]
+    })
+
+    reference_trajectory = [
+        HumanMessage(content="What's happening in SF today?"),
+        AIMessage(content="", tool_calls=[
+            {"id": "call_1", "name": "get_events", "args": {"city": "SF"}},
+            {"id": "call_2", "name": "get_weather", "args": {"city": "SF"}},
+        ]),
+        ToolMessage(content="Concert at the park in SF tonight.", tool_call_id="call_1"),
+        ToolMessage(content="It's 75 degrees and sunny in SF.", tool_call_id="call_2"),
+        AIMessage(content="Today in SF: 75 degrees and sunny with a concert at the park tonight."),
+    ]
+
+    evaluation = evaluator(
+        outputs=result["messages"],
+        reference_outputs=reference_trajectory,
+    )
+    assert evaluation["score"] is True
+```
+
+
+
+Subset and superset match
+
+The `superset` and `subset` modes match partial trajectories. The `superset` mode verifies that the agent called at least the tools in the reference trajectory, allowing additional tool calls. The `subset` mode ensures the agent did not call any tools beyond those in the reference.
+
+```
+@tool
+def get_detailed_forecast(city: str):
+    """Get detailed weather forecast for a city."""
+    return f"Detailed forecast for {city}: sunny all week."
+
+agent = create_agent("claude-sonnet-4-6", tools=[get_weather, get_detailed_forecast])
+
+evaluator = create_trajectory_match_evaluator(
+    trajectory_match_mode="superset",
+)
+
+def test_agent_calls_required_tools_plus_extra():
+    result = agent.invoke({
+        "messages": [HumanMessage(content="What's the weather in Boston?")]
+    })
+
+    # Reference only requires get_weather, but agent may call additional tools
+    reference_trajectory = [
+        HumanMessage(content="What's the weather in Boston?"),
+        AIMessage(content="", tool_calls=[
+            {"id": "call_1", "name": "get_weather", "args": {"city": "Boston"}},
+        ]),
+        ToolMessage(content="It's 75 degrees and sunny in Boston.", tool_call_id="call_1"),
+        AIMessage(content="The weather in Boston is 75 degrees and sunny."),
+    ]
+
+    evaluation = evaluator(
+        outputs=result["messages"],
+        reference_outputs=reference_trajectory,
+    )
+    assert evaluation["score"] is True
+```
+
+You can also set the `tool_args_match_mode` property and/or `tool_args_match_overrides` to customize how the evaluator considers equality between tool calls in the actual trajectory vs. the reference. By default, only tool calls with the same arguments to the same tool are considered equal. Visit the repository for more details.
+
+## ​ LLM-as-judge evaluator
+
+You can use an LLM to evaluate the agent’s execution path with the `create_trajectory_llm_as_judge` function. Unlike trajectory match evaluators, it doesn’t require a reference trajectory, but one can be provided if available.
+
+
+Without reference trajectory
+
+```
+from agentevals.trajectory.llm import create_trajectory_llm_as_judge, TRAJECTORY_ACCURACY_PROMPT
+
+evaluator = create_trajectory_llm_as_judge(
+    model="openai:o3-mini",
+    prompt=TRAJECTORY_ACCURACY_PROMPT,
+)
+
+def test_trajectory_quality():
+    result = agent.invoke({
+        "messages": [HumanMessage(content="What's the weather in Seattle?")]
+    })
+
+    evaluation = evaluator(
+        outputs=result["messages"],
+    )
+    assert evaluation["score"] is True
+```
+
+
+
+With reference trajectory
+
+If you have a reference trajectory, use the prebuilt `TRAJECTORY_ACCURACY_PROMPT_WITH_REFERENCE` prompt:
+
+```
+from agentevals.trajectory.llm import create_trajectory_llm_as_judge, TRAJECTORY_ACCURACY_PROMPT_WITH_REFERENCE
+
+evaluator = create_trajectory_llm_as_judge(
+    model="openai:o3-mini",
+    prompt=TRAJECTORY_ACCURACY_PROMPT_WITH_REFERENCE,
+)
+evaluation = evaluator(
+    outputs=result["messages"],
+    reference_outputs=reference_trajectory,
+)
+```
+
+For more configurability over how the LLM evaluates the trajectory, visit the repository.
+
+### ​ Async support
+
+All `agentevals` evaluators support Python asyncio. Async versions are available by adding `async` after `create_` in the function name.
+
+
+Async judge and evaluator example
+
+```
+from agentevals.trajectory.llm import create_async_trajectory_llm_as_judge, TRAJECTORY_ACCURACY_PROMPT
+from agentevals.trajectory.match import create_async_trajectory_match_evaluator
+
+async_judge = create_async_trajectory_llm_as_judge(
+    model="openai:o3-mini",
+    prompt=TRAJECTORY_ACCURACY_PROMPT,
+)
+
+async_evaluator = create_async_trajectory_match_evaluator(
+    trajectory_match_mode="strict",
+)
+
+async def test_async_evaluation():
+    result = await agent.ainvoke({
+        "messages": [HumanMessage(content="What's the weather?")]
+    })
+
+    evaluation = await async_judge(outputs=result["messages"])
+    assert evaluation["score"] is True
+```
+
+## ​ Run evals in LangSmith
+
+For tracking experiments over time, log evaluator results to LangSmith. First, set the required environment variables:
+
+```
+export LANGSMITH_API_KEY="your_langsmith_api_key"
+export LANGSMITH_TRACING="true"
+```
+
+LangSmith offers two main approaches for running evaluations: pytest integration and the `evaluate` function.
+
+
+Use pytest integration
+
+```
+import pytest
+from langsmith import testing as t
+from agentevals.trajectory.llm import create_trajectory_llm_as_judge, TRAJECTORY_ACCURACY_PROMPT
+
+trajectory_evaluator = create_trajectory_llm_as_judge(
+    model="openai:o3-mini",
+    prompt=TRAJECTORY_ACCURACY_PROMPT,
+)
+
+@pytest.mark.langsmith
+def test_trajectory_accuracy():
+    result = agent.invoke({
+        "messages": [HumanMessage(content="What's the weather in SF?")]
+    })
+
+    reference_trajectory = [
+        HumanMessage(content="What's the weather in SF?"),
+        AIMessage(content="", tool_calls=[
+            {"id": "call_1", "name": "get_weather", "args": {"city": "SF"}},
+        ]),
+        ToolMessage(content="It's 75 degrees and sunny in SF.", tool_call_id="call_1"),
+        AIMessage(content="The weather in SF is 75 degrees and sunny."),
+    ]
+
+    t.log_inputs({})
+    t.log_outputs({"messages": result["messages"]})
+    t.log_reference_outputs({"messages": reference_trajectory})
+
+    trajectory_evaluator(
+        outputs=result["messages"],
+        reference_outputs=reference_trajectory
+    )
+```
+
+Run the evaluation with pytest:
+
+```
+pytest test_trajectory.py --langsmith-output
+```
+
+
+
+Use the evaluate function
+
+Create a LangSmith dataset and use the `evaluate` function. The dataset must have the following schema:
+
+* **input**: `{"messages": [...]}` input messages to call the agent with.
+* **output**: `{"messages": [...]}` expected message history in the agent output. For trajectory evaluation, you can choose to keep only assistant messages.
+
+```
+from langsmith import Client
+from agentevals.trajectory.llm import create_trajectory_llm_as_judge, TRAJECTORY_ACCURACY_PROMPT
+
+client = Client()
+
+trajectory_evaluator = create_trajectory_llm_as_judge(
+    model="openai:o3-mini",
+    prompt=TRAJECTORY_ACCURACY_PROMPT,
+)
+
+def run_agent(inputs):
+    return agent.invoke(inputs)["messages"]
+
+experiment_results = client.evaluate(
+    run_agent,
+    data="your_dataset_name",
+    evaluators=[trajectory_evaluator]
+)
+```
+
+To learn more about evaluating your agent, see the LangSmith docs.
+
+---
+
+Connect these docs to Claude, VSCode, and more via MCP for real-time answers.
+
+Edit this page on GitHub or file an issue.
+
+Was this page helpful?
+
+YesNo
+
+Integration testing
+
+Previous
+
+Agent Chat UI
+
+Next
+
+⌘I

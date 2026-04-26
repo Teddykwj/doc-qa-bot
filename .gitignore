@@ -6,3 +6,5 @@ venv/
 data/processed/
 *.egg-info/
 .pytest_cache/
+/scripts/list.txt
+plan.txt
