@@ -1,6 +1,6 @@
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
+from langchain_core.runnables import RunnableLambda
 
 RAG_PROMPT = ChatPromptTemplate.from_template(
     """You are a helpful assistant for answering questions about development documentation.
@@ -20,9 +20,12 @@ def format_docs(docs):
 
 
 def build_rag_chain(retriever, llm):
-    return (
-        {"context": retriever | format_docs, "question": RunnablePassthrough()}
-        | RAG_PROMPT
-        | llm
-        | StrOutputParser()
-    )
+    answer_chain = RAG_PROMPT | llm | StrOutputParser()
+
+    def _run(question: str) -> dict:
+        docs = retriever.invoke(question)
+        answer = answer_chain.invoke({"context": format_docs(docs), "question": question})
+        sources = sorted({doc.metadata.get("source", "") for doc in docs})
+        return {"answer": answer, "sources": sources}
+
+    return RunnableLambda(_run)

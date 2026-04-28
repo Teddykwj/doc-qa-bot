@@ -9,4 +9,5 @@ router = APIRouter(prefix="/query", tags=["query"])
 
 @router.post("", response_model=QueryResponse)
 def query(request: QueryRequest, svc: QueryService = Depends(get_query_service)):
-    return QueryResponse(answer=svc.answer(request.question))
+    result = svc.answer(request.question)
+    return QueryResponse(**result)

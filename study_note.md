@@ -302,6 +302,77 @@ def build_rag_chain(retriever, llm):
 
 ---
 
+### Runnable
+
+LangChain에서 `|` 로 연결하거나 `invoke`를 호출할 수 있는 모든 객체의 베이스 클래스.
+
+**판단 기준**: `langchain_core.runnables.Runnable`을 상속받았는지
+```python
+from langchain_core.runnables import Runnable
+isinstance(chain, Runnable)  # True / False
+```
+
+**상속 구조**
+```
+Runnable
+├── RunnableLambda       ← 일반 함수를 Runnable로 래핑
+├── RunnablePassthrough  ← 입력 그대로 통과
+├── RunnableParallel     ← 여러 Runnable 병렬 실행
+├── ChatPromptTemplate
+├── BaseLLM / BaseChatModel
+├── BaseRetriever
+└── BaseOutputParser
+```
+
+**공통 메서드**
+| 메서드 | 설명 |
+|---|---|
+| `invoke(input)` | 단일 입력 → 단일 출력 (동기) |
+| `ainvoke(input)` | 비동기 버전 |
+| `batch([...])` | 여러 입력 동시 처리 |
+| `stream(input)` | 토큰 단위 스트리밍 출력 |
+
+일반 함수는 Runnable이 아니지만 `|` 로 연결 시 LangChain이 자동으로 `RunnableLambda`로 래핑해줌.
+
+### RunnableLambda
+
+일반 함수를 Runnable로 만드는 래퍼. `invoke` 등 Runnable 인터페이스를 부여함.
+
+```python
+def _run(question: str) -> dict:
+    ...
+
+_run.invoke("질문")           # AttributeError — 일반 함수는 invoke 없음
+RunnableLambda(_run).invoke("질문")  # 정상 동작
+```
+
+LCEL `|` 파이프만으로 표현하기 복잡한 로직(예: 출처 반환)을 일반 함수로 작성하고 래핑할 때 사용.
+
+### Document 객체
+
+LangChain에서 문서 청크를 표현하는 기본 단위.
+
+```python
+Document(
+    page_content="LangChain is a framework...",  # 청크 텍스트
+    metadata={"source": "data/raw/langchain/overview.md"}  # 출처 등 부가정보
+)
+```
+
+- `doc.page_content` — 청크 텍스트. `format_docs`에서 프롬프트 context로 변환할 때 사용
+- `doc.metadata.get("source", "")` — 출처 경로. `"source"` 키가 없을 때 `""` 반환 (KeyError 방지)
+
+### 출처(sources) 추출 패턴
+
+```python
+sources = sorted({doc.metadata.get("source", "") for doc in docs})
+```
+
+- `{}` (set 컴프리헨션) — 같은 파일에서 여러 청크가 나와도 중복 제거
+- `sorted()` — set은 순서 비보장이므로 알파벳순 정렬로 응답 일관성 확보
+
+---
+
 ## 8. API (FastAPI)
 
 파일: `src/api/`
