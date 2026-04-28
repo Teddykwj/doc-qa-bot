@@ -325,6 +325,49 @@ def build_rag_chain(retriever, llm):
 
 ---
 
+## 9. 인제스트 중복 방지
+
+파일: `app/service/ingest_service.py`
+
+### 문제
+`add_documents()`는 호출할 때마다 새 UUID를 생성해서 저장함.
+같은 문서를 두 번 ingest하면 ChromaDB에 동일한 청크가 중복으로 쌓임.
+→ 검색 결과에 같은 내용이 여러 번 등장, 벡터 공간 오염
+
+### 해결 전략: 결정론적 ID + 중복 필터
+
+```
+청크 → ID 생성 (md5) → ChromaDB에 존재 여부 확인 → 없는 것만 저장
+```
+
+**ID 생성 방식**
+```python
+def _chunk_id(source: str, content: str) -> str:
+    return hashlib.md5(f"{source}:{content}".encode()).hexdigest()
+```
+- `source`: 문서 파일 경로 (metadata에서 추출)
+- `content`: 청크 텍스트
+- 두 값이 같으면 항상 같은 ID → 멱등성 보장
+
+**중복 필터링**
+```python
+ids = [_chunk_id(c.metadata.get("source", ""), c.page_content) for c in chunks]
+
+existing = set(self._vectorstore._collection.get(ids=ids)["ids"])
+new_pairs = [(chunk, id_) for chunk, id_ in zip(chunks, ids) if id_ not in existing]
+
+if new_pairs:
+    new_chunks, new_ids = zip(*new_pairs)
+    self._vectorstore.add_documents(list(new_chunks), ids=list(new_ids))
+```
+- `_collection.get(ids=ids)`: ChromaDB에서 해당 ID 중 실제로 존재하는 것만 반환
+- `existing`에 없는 것만 `add_documents()` 호출
+- 반환값: 새로 추가된 청크 수 (전체 청크 수 아님)
+
+### 핵심 개념: 멱등성 (Idempotency)
+같은 입력으로 몇 번을 실행해도 결과가 동일한 성질.
+→ 동일 문서를 10번 ingest해도 DB 상태는 1번 ingest한 것과 같음
+
 ## Q&A / 메모
 
 <!-- 공부하면서 생긴 질문이나 메모를 여기 기록 -->
