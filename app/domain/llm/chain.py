@@ -22,9 +22,9 @@ def format_docs(docs):
 def build_rag_chain(retriever, llm):
     answer_chain = RAG_PROMPT | llm | StrOutputParser()
 
-    def _run(question: str) -> dict:
-        docs = retriever.invoke(question)
-        answer = answer_chain.invoke({"context": format_docs(docs), "question": question})
+    async def _run(question: str) -> dict:
+        docs = await retriever.ainvoke(question)
+        answer = await answer_chain.ainvoke({"context": format_docs(docs), "question": question})
         sources = sorted({doc.metadata.get("source", "") for doc in docs})
         return {"answer": answer, "sources": sources}
 

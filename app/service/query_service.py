@@ -9,9 +9,9 @@ class QueryService:
     def __init__(self, chain: Runnable):
         self._chain = chain
 
-    def answer(self, question: str) -> dict:
+    async def answer(self, question: str) -> dict:
         try:
-            return self._chain.invoke(question)
+            return await self._chain.ainvoke(question)
         except requests.exceptions.ConnectionError as e:
             raise OllamaConnectionError("Cannot connect to Ollama. Is it running?") from e
         except Exception as e:

@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 from pathlib import Path
 
@@ -19,15 +20,19 @@ class IngestService:
     def __init__(self, vectorstore: Chroma):
         self._vectorstore = vectorstore
 
-    def run(self, source_dir: str | None = None) -> int:
+    async def run(self, source_dir: str | None = None) -> int:
         source = source_dir or settings.data_raw_dir
 
         if not Path(source).exists():
             raise IngestError(f"Source directory not found: {source}")
 
         try:
-            docs = load_documents(source)
-            chunks = split_documents(docs, chunk_size=settings.chunk_size, chunk_overlap=settings.chunk_overlap)
+            docs = await asyncio.to_thread(load_documents, source)
+            chunks = await asyncio.to_thread(
+                split_documents, docs,
+                chunk_size=settings.chunk_size,
+                chunk_overlap=settings.chunk_overlap,
+            )
 
             if not chunks:
                 raise IngestError(f"No documents found in: {source}")
@@ -38,7 +43,7 @@ class IngestService:
 
             if new_pairs:
                 new_chunks, new_ids = zip(*new_pairs)
-                self._vectorstore.add_documents(list(new_chunks), ids=list(new_ids))
+                await self._vectorstore.aadd_documents(list(new_chunks), ids=list(new_ids))
 
         except (IngestError, OllamaConnectionError):
             raise
