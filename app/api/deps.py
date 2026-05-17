@@ -5,6 +5,7 @@ from app.domain.llm.chain import build_rag_chain
 from app.domain.llm.ollama_client import get_llm
 from app.domain.retrieval.retriever import get_retriever
 from app.infrastructure.vectorstore import get_vectorstore
+from app.service.history_store import InMemoryHistoryStore
 from app.service.ingest_service import IngestService
 from app.service.query_service import QueryService
 from config.settings import settings
@@ -28,9 +29,18 @@ def _ingest_service() -> IngestService:
     return IngestService(_vectorstore())
 
 
+@lru_cache
+def _history_store() -> InMemoryHistoryStore:
+    return InMemoryHistoryStore()
+
+
 def get_query_service() -> QueryService:
     return _query_service()
 
 
 def get_ingest_service() -> IngestService:
     return _ingest_service()
+
+
+def get_history_store() -> InMemoryHistoryStore:
+    return _history_store()
