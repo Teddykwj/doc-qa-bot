@@ -284,21 +284,43 @@ StrOutputParser → .content 추출 → 문자열 반환
 - LLM이 반환하는 `AIMessage` 객체에서 `.content`(텍스트)만 추출
 - 없으면 AIMessage 객체가 그대로 반환되어 문자열로 쓸 수 없음
 
-### 코드
+### RAGChain 클래스로 전환 (히스토리 + 스트리밍 지원)
+
+LCEL 파이프만으로는 표현이 복잡해질 때 (히스토리 조건 분기, 스트리밍 등) `RAGChain` 클래스로 직접 구현.
+
 ```python
-RAG_PROMPT = ChatPromptTemplate.from_template("""...\nContext:\n{context}\n\nQuestion: {question}\n\nAnswer:""")
+class RAGChain:
+    def __init__(self, retriever, llm):
+        self._retriever = retriever
+        self._contextualize = CONTEXTUALIZE_PROMPT | llm | StrOutputParser()
+        self._answer = RAG_PROMPT | llm | StrOutputParser()
 
-def format_docs(docs):
-    return "\n\n".join(doc.page_content for doc in docs)
-
-def build_rag_chain(retriever, llm):
-    return (
-        {"context": retriever | format_docs, "question": RunnablePassthrough()}
-        | RAG_PROMPT
-        | llm
-        | StrOutputParser()
-    )
+    async def ainvoke(self, inputs: dict) -> dict: ...   # 일반 응답
+    async def astream(self, inputs: dict): ...           # 스트리밍 응답 (async generator)
 ```
+
+- `self._answer.astream()` — LangChain 체인의 내장 메서드. `self.astream()`과 다른 객체
+- `ainvoke` / `astream` 둘 다 입력은 **한 번에** 받고, 출력만 방식이 다름
+
+### MessagesPlaceholder
+
+프롬프트 안에 메시지 리스트를 삽입하는 자리표시자. 대화 히스토리 전달에 사용.
+
+```python
+RAG_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "...Context:\n{context}"),
+    MessagesPlaceholder("chat_history"),   # ← HumanMessage/AIMessage 리스트가 들어감
+    ("human", "{input}"),
+])
+```
+
+### ainvoke vs astream
+
+| | `ainvoke` | `astream` |
+|---|---|---|
+| 입력 | 동일 (dict 한 번에) | 동일 |
+| 출력 | 완성된 문자열 한 번에 반환 | 토큰 생성될 때마다 yield |
+| 대기 | LLM이 다 끝날 때까지 | 토큰마다 즉시 |
 
 ---
 
@@ -438,6 +460,168 @@ if new_pairs:
 ### 핵심 개념: 멱등성 (Idempotency)
 같은 입력으로 몇 번을 실행해도 결과가 동일한 성질.
 → 동일 문서를 10번 ingest해도 DB 상태는 1번 ingest한 것과 같음
+
+## 10. 대화 히스토리 (멀티턴)
+
+파일: `app/service/history_store.py`, `app/api/routers/query.py`
+
+### 문제
+매 질문이 독립적으로 처리됨 → "아까 말한 거 기준으로 설명해줘" 같은 후속 질문 불가
+
+### 구조
+
+```
+클라이언트 → session_id 포함해서 요청
+                ↓
+            InMemoryHistoryStore.get(session_id)  → 이전 대화 목록
+                ↓
+            QueryService.answer(question, history)
+                ↓
+            RAGChain: 히스토리 있으면 질문 재구성(contextualize) → 검색 → 답변
+                ↓
+            store.add_exchange(session_id, question, answer)  → 히스토리 저장
+```
+
+### InMemoryHistoryStore
+
+```python
+class InMemoryHistoryStore:
+    def __init__(self):
+        self._store: dict[str, list[BaseMessage]] = defaultdict(list)
+
+    def get(self, session_id: str) -> list[BaseMessage]:
+        return list(self._store[session_id])  # 복사본 반환
+
+    def add_exchange(self, session_id: str, question: str, answer: str) -> None:
+        self._store[session_id].extend([
+            HumanMessage(content=question),
+            AIMessage(content=answer),
+        ])
+```
+
+- `defaultdict(list)` — 없는 session_id 접근 시 자동으로 빈 리스트 생성
+- `HumanMessage` / `AIMessage` — LangChain의 대화 메시지 타입. `MessagesPlaceholder`에 전달
+
+### 질문 재구성 (Contextualize)
+
+히스토리가 있을 때, 후속 질문을 단독으로 이해 가능한 질문으로 변환.
+
+```
+히스토리: "LangChain이 뭐야?" / "LangChain은 LLM 프레임워크야"
+현재 질문: "그럼 LCEL은?"
+     ↓ contextualize
+변환 후: "LangChain에서 LCEL이란 무엇인가?"
+     ↓ 이 질문으로 벡터 검색
+```
+
+```python
+CONTEXTUALIZE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "reformulate the question as a standalone question..."),
+    MessagesPlaceholder("chat_history"),
+    ("human", "{input}"),
+])
+
+# 히스토리 없으면 그냥 원본 질문으로 검색
+retrieval_query = (
+    await contextualize_chain.ainvoke({...})
+    if history else question
+)
+```
+
+### session_id
+
+- 클라이언트가 `session_id`를 보내지 않으면 서버에서 `uuid4()`로 생성해서 응답에 포함
+- 클라이언트는 다음 요청 때 이 `session_id`를 다시 보내면 같은 대화 맥락 유지
+
+---
+
+## 11. 스트리밍 응답
+
+파일: `app/domain/llm/chain.py`, `app/api/routers/query.py`
+
+### 문제
+LLM 응답이 완성될 때까지 (수 초) 클라이언트는 아무것도 못 받음 → 체감 응답속도 느림
+
+### yield / 제너레이터
+
+`yield`가 있는 함수는 **제너레이터** — `return` 처럼 값을 내보내지만 함수를 종료하지 않고 일시 정지했다가 재개.
+
+```python
+# return: 다 만든 후 한 번에 반환
+def get_numbers():
+    return [1, 2, 3]
+
+# yield: 하나씩 순서대로 내보냄
+def get_numbers():
+    yield 1   # 일시 정지
+    yield 2   # 다음 호출 때 재개
+    yield 3
+```
+
+`async def` + `yield` 조합 → **비동기 제너레이터** (`async for`로 소비)
+
+### SSE (Server-Sent Events)
+
+서버 → 클라이언트 단방향 스트리밍 프로토콜. `text/event-stream` 형식.
+
+```
+data: {"type": "sources", "data": ["doc1.pdf"]}\n\n
+data: {"type": "token", "data": "안"}\n\n
+data: {"type": "token", "data": "녕"}\n\n
+data: {"type": "done", "session_id": "abc-123"}\n\n
+```
+
+- 각 이벤트는 `data: <내용>\n\n` 형식 (빈 줄 2개로 구분)
+- WebSocket과 달리 단방향이라 구조가 단순
+
+### FastAPI StreamingResponse
+
+```python
+from fastapi.responses import StreamingResponse
+
+async def event_generator():
+    async for event in svc.stream(question, history):
+        yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+    yield f"data: {json.dumps({'type': 'done', 'session_id': session_id})}\n\n"
+
+return StreamingResponse(event_generator(), media_type="text/event-stream")
+```
+
+- `StreamingResponse`는 제너레이터를 받아서 생성되는 대로 HTTP 응답으로 흘려보냄
+- `response_model` 사용 불가 — Pydantic 직렬화 대신 직접 `json.dumps`
+
+### 스트리밍 흐름
+
+```
+POST /query/stream
+    ↓
+RAGChain.astream()
+    ↓ yield {"type": "sources", "data": [...]}   ← retrieval 완료 후 즉시
+    ↓ yield {"type": "token", "data": "안"}       ← LLM 토큰마다
+    ↓ yield {"type": "token", "data": "녕"}
+    ↓ (스트림 끝)
+store.add_exchange(...)                           ← 전체 답변 완성 후 히스토리 저장
+    ↓ yield {"type": "done", "session_id": "..."}
+```
+
+- retrieval(문서 검색)은 먼저 완료해야 하므로 `await`로 대기 후 sources yield
+- LLM 응답만 토큰 단위로 스트리밍
+
+### ainvoke vs astream 비교 (체인 레벨)
+
+```python
+# ainvoke: LLM이 다 끝날 때까지 기다렸다가 한 번에 반환
+answer = await self._answer.ainvoke({...})
+# answer = "안녕하세요"
+
+# astream: 토큰이 생성될 때마다 즉시 yield
+async for chunk in self._answer.astream({...}):
+    # chunk = "안"  /  "녕"  /  "하세요"
+```
+
+입력은 동일하게 dict 한 번에 전달. 출력 방식만 다름.
+
+---
 
 ## Q&A / 메모
 
