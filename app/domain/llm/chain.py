@@ -1,7 +1,6 @@
 from langchain_core.messages import BaseMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables import RunnableLambda
 
 CONTEXTUALIZE_PROMPT = ChatPromptTemplate.from_messages([
     ("system", "Given the chat history and the latest user question, reformulate the question as a standalone question. Do not answer it, just reformulate if needed, otherwise return as is."),
@@ -24,21 +23,24 @@ def format_docs(docs):
     return "\n\n".join(doc.page_content for doc in docs)
 
 
-def build_rag_chain(retriever, llm):
-    contextualize_chain = CONTEXTUALIZE_PROMPT | llm | StrOutputParser()
-    answer_chain = RAG_PROMPT | llm | StrOutputParser()
+class RAGChain:
+    def __init__(self, retriever, llm):
+        self._retriever = retriever
+        self._contextualize = CONTEXTUALIZE_PROMPT | llm | StrOutputParser()
+        self._answer = RAG_PROMPT | llm | StrOutputParser()
 
-    async def _run(inputs: dict) -> dict:
+    async def _resolve_query(self, question: str, history: list[BaseMessage]) -> str:
+        if not history:
+            return question
+        return await self._contextualize.ainvoke({"input": question, "chat_history": history})
+
+    async def ainvoke(self, inputs: dict) -> dict:
         question: str = inputs["question"]
         history: list[BaseMessage] = inputs.get("chat_history", [])
 
-        retrieval_query = (
-            await contextualize_chain.ainvoke({"input": question, "chat_history": history})
-            if history else question
-        )
-
-        docs = await retriever.ainvoke(retrieval_query)
-        answer = await answer_chain.ainvoke({
+        retrieval_query = await self._resolve_query(question, history)
+        docs = await self._retriever.ainvoke(retrieval_query)
+        answer = await self._answer.ainvoke({
             "context": format_docs(docs),
             "input": question,
             "chat_history": history,
@@ -46,4 +48,23 @@ def build_rag_chain(retriever, llm):
         sources = sorted({doc.metadata.get("source", "") for doc in docs})
         return {"answer": answer, "sources": sources}
 
-    return RunnableLambda(_run)
+    async def astream(self, inputs: dict):
+        question: str = inputs["question"]
+        history: list[BaseMessage] = inputs.get("chat_history", [])
+
+        retrieval_query = await self._resolve_query(question, history)
+        docs = await self._retriever.ainvoke(retrieval_query)
+        sources = sorted({doc.metadata.get("source", "") for doc in docs})
+
+        yield {"type": "sources", "data": sources}
+
+        async for chunk in self._answer.astream({
+            "context": format_docs(docs),
+            "input": question,
+            "chat_history": history,
+        }):
+            yield {"type": "token", "data": chunk}
+
+
+def build_rag_chain(retriever, llm) -> RAGChain:
+    return RAGChain(retriever, llm)
