@@ -3,7 +3,7 @@ from functools import lru_cache
 from app.infrastructure.embedder import get_embeddings
 from app.domain.llm.chain import build_rag_chain
 from app.domain.llm.ollama_client import get_llm
-from app.domain.retrieval.retriever import get_retriever
+from app.domain.retrieval.retriever import get_hybrid_retriever
 from app.infrastructure.vectorstore import get_vectorstore
 from app.service.history_store import InMemoryHistoryStore
 from app.service.ingest_service import IngestService
@@ -19,7 +19,7 @@ def _vectorstore():
 
 @lru_cache
 def _query_service() -> QueryService:
-    retriever = get_retriever(_vectorstore(), k=settings.retriever_k)
+    retriever = get_hybrid_retriever(_vectorstore(), k=settings.retriever_k)
     chain = build_rag_chain(retriever, get_llm())
     return QueryService(chain)
 
