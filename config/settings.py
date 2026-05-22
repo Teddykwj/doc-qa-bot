@@ -25,5 +25,8 @@ class Settings(BaseSettings):
     # Retrieval
     retriever_k: int = 4
 
+    # Scheduler
+    ingest_schedule_hour: int = 3  # 매일 새벽 3시
+
 
 settings = Settings()
