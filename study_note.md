@@ -623,6 +623,191 @@ async for chunk in self._answer.astream({...}):
 
 ---
 
+## 12. 하이브리드 검색
+
+파일: `app/domain/retrieval/retriever.py`
+
+### 문제
+벡터 검색만으로는 정확한 단어 매칭이 약함.
+
+- `"ConnectionError 몇 번째 줄?"` — 고유 식별자는 의미 기반으로 못 찾음
+- `"v0.2.3 변경사항"` — 버전 번호 같은 숫자/고유명사도 마찬가지
+
+### BM25란?
+
+키워드 기반 검색 알고리즘. 단어 빈도(TF)와 문서 희귀도(IDF)를 조합해서 점수 계산.
+
+| | 벡터 검색 | BM25 |
+|---|---|---|
+| 잘하는 것 | 의미 유사도, 동의어, 문맥 | 정확한 단어 매칭, 고유명사, 코드 식별자 |
+| 못하는 것 | 정확한 단어 매칭 | 의미 기반 유사도 |
+
+### RRF (Reciprocal Rank Fusion)
+
+두 검색 결과의 순위를 점수로 변환해서 합산하는 방식. 스케일이 다른 두 점수를 직접 더하는 것보다 안정적.
+
+```python
+rrf_score = 1/(rank_in_bm25 + 60) + 1/(rank_in_vector + 60)
+```
+
+- `60`은 상수 (rrf_k) — 높을수록 1위와 하위 순위 간 점수 차이가 줄어듦
+- 두 검색 모두에서 상위에 오른 문서가 최종 상위권 차지
+
+```
+벡터 검색 결과: [문서A(1위), 문서C(2위), 문서E(3위)]
+BM25 결과:     [문서B(1위), 문서A(2위), 문서D(3위)]
+
+RRF 합산:
+  문서A = 1/(1+60) + 1/(2+60) = 0.0164 + 0.0161 = 0.0325  ← 1위
+  문서B = 1/(1+60)             = 0.0164             ← 2위
+  문서C = 1/(2+60)             = 0.0161             ← 3위
+```
+
+### HybridRetriever 구현
+
+`EnsembleRetriever`가 현재 LangChain 버전에 없어서 직접 구현.
+
+```python
+class HybridRetriever(BaseRetriever):
+    bm25: BM25Retriever
+    vector: BaseRetriever
+    k: int = 4
+    rrf_k: int = 60
+
+    def _get_relevant_documents(self, query, ...) -> list[Document]:
+        bm25_docs = self.bm25.invoke(query)
+        vector_docs = self.vector.invoke(query)
+
+        scores: dict[str, float] = {}
+        doc_map: dict[str, Document] = {}
+
+        for rank, doc in enumerate(bm25_docs):
+            key = doc.page_content
+            scores[key] = scores.get(key, 0) + 1 / (rank + self.rrf_k)
+            doc_map[key] = doc
+
+        for rank, doc in enumerate(vector_docs):
+            key = doc.page_content
+            scores[key] = scores.get(key, 0) + 1 / (rank + self.rrf_k)
+            doc_map[key] = doc
+
+        ranked = sorted(scores, key=lambda k: scores[k], reverse=True)
+        return [doc_map[key] for key in ranked[:self.k]]
+```
+
+- `page_content`를 key로 중복 제거 + RRF 합산
+- `BaseRetriever`를 상속하면 LangChain 체인에 그대로 연결 가능
+
+### BM25 인덱스 구성
+
+BM25는 인메모리 — 서버 시작 시 ChromaDB에서 전체 청크를 읽어 인덱스 구성.
+
+```python
+def get_hybrid_retriever(vectorstore, k=4):
+    result = vectorstore._collection.get(include=["documents", "metadatas"])
+    docs = [Document(page_content=text, metadata=meta or {}) for text, meta in ...]
+
+    if not docs:
+        return get_retriever(vectorstore, k=k)  # fallback
+
+    bm25 = BM25Retriever.from_documents(docs, k=k)
+    vector = get_retriever(vectorstore, k=k)
+    return HybridRetriever(bm25=bm25, vector=vector, k=k)
+```
+
+### 주의: BM25 인덱스 갱신 시점
+
+`lru_cache`로 서버 시작 시 한 번만 생성. 새 문서를 ingest해도 BM25에는 즉시 반영되지 않음.
+→ 벡터 검색은 즉시 반영, BM25는 서버 재시작 후 반영.
+
+---
+
+## 13. 자동 인제스트 스케줄러
+
+파일: `app/service/scheduler.py`, `app/main.py`, `config/settings.py`
+
+### 목적
+스크래핑 → 인제스트를 주기적으로 자동 실행해서 문서를 최신 상태로 유지.
+
+### APScheduler
+
+Python 프로세스 내부에서 동작하는 스케줄러 라이브러리. 별도 인프라(Redis 등) 없이 FastAPI 서버 안에서 함께 실행.
+
+```python
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+scheduler = AsyncIOScheduler()
+scheduler.add_job(_run_ingest, "cron", hour=3)  # 매일 새벽 3시
+scheduler.start()
+```
+
+- `AsyncIOScheduler` — FastAPI의 이벤트 루프와 같은 루프에서 실행
+- `"cron"` — 리눅스 cron처럼 주기 지정. `hour`, `minute`, `day_of_week` 등 조합 가능
+
+### 인제스트 후 BM25 캐시 무효화
+
+새 문서가 추가되면 `lru_cache`로 고정된 `_query_service`를 재생성해야 BM25 인덱스에 반영됨.
+
+```python
+async def _run_ingest() -> None:
+    try:
+        count = await _ingest_service().run()
+        if count > 0:
+            _query_service.cache_clear()  # 다음 요청 시 HybridRetriever 재구성
+        logger.info("Scheduled ingest complete: %d new chunks", count)
+    except Exception as e:
+        logger.error("Scheduled ingest failed: %s", e)
+```
+
+- `cache_clear()` — `lru_cache`가 붙은 함수에 자동으로 생기는 메서드. 캐시를 비워서 다음 호출 시 재생성하게 함
+- 예외가 나도 서버는 계속 실행 — 스케줄 작업 실패가 서버를 죽이면 안 되므로 `try/except`로 처리
+
+### @asynccontextmanager + lifespan
+
+FastAPI의 lifespan: 서버 시작/종료 시점에 실행할 코드를 등록하는 방식.
+
+```python
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ── 서버 시작 시 ──
+    scheduler = create_scheduler(hour=settings.ingest_schedule_hour)
+    scheduler.start()
+
+    yield  # 서버가 실행되는 동안 여기서 대기
+
+    # ── 서버 종료 시 ──
+    scheduler.shutdown()
+
+app = FastAPI(title="Doc QA Bot", lifespan=lifespan)
+```
+
+**@asynccontextmanager**
+- `yield` 앞 = `__aenter__` (시작 로직)
+- `yield` 뒤 = `__aexit__` (종료 로직)
+- 예외가 발생해도 `yield` 뒤 코드는 반드시 실행 (`try/finally`와 동일한 보장)
+- 클래스로 `__aenter__` / `__aexit__`를 직접 구현하는 대신 제너레이터 함수 하나로 대체
+
+### 설정
+
+`config/settings.py`에서 시각 관리. `.env`로 오버라이드 가능.
+
+```python
+ingest_schedule_hour: int = 3  # 기본값: 새벽 3시
+```
+
+```
+# .env
+INGEST_SCHEDULE_HOUR=6
+```
+
+### 한계
+
+- 서버가 죽으면 스케줄도 같이 멈춤 (Celery Beat는 독립 프로세스라 이 문제 없음)
+- 실행 이력 저장 없음 — 실패해도 로그만 남고 재시도 없음
+- BM25 캐시 무효화 후 첫 요청 시 재구성 비용 발생 (전체 청크 재로딩)
+
+---
+
 ## Q&A / 메모
 
 <!-- 공부하면서 생긴 질문이나 메모를 여기 기록 -->
