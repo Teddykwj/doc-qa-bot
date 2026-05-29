@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.exceptions import register_exception_handlers
 from app.api.routers import health, ingest, query
@@ -17,6 +18,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Doc QA Bot", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.include_router(health.router)
 app.include_router(query.router)

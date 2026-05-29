@@ -28,5 +28,8 @@ class Settings(BaseSettings):
     # Scheduler
     ingest_schedule_hour: int = 3  # 매일 새벽 3시
 
+    # CORS
+    cors_origins: list[str] = ["http://localhost:8501"]
+
 
 settings = Settings()
