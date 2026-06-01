@@ -808,6 +808,112 @@ INGEST_SCHEDULE_HOUR=6
 
 ---
 
+## 14. Streamlit UI
+
+파일: `streamlit_app.py`
+
+### 개념
+
+Python 코드만으로 웹 UI를 만드는 라이브러리. 채팅 전용 컴포넌트를 기본 제공해서 별도 프론트엔드 없이 봇 UI를 빠르게 구성 가능.
+
+### 핵심 컴포넌트
+
+```python
+st.chat_input("질문을 입력하세요")   # 채팅 입력창
+st.chat_message("user")             # 메시지 말풍선 (user / assistant)
+st.write_stream(generator)          # 제너레이터를 받아 실시간 타이핑 효과
+st.expander("출처")                  # 접고 펼 수 있는 영역
+```
+
+### st.session_state
+
+Streamlit은 사용자 입력마다 스크립트 전체를 재실행함. 대화 기록처럼 재실행 사이에 유지해야 할 값은 `st.session_state`에 저장.
+
+```python
+if "messages" not in st.session_state:
+    st.session_state.messages = []   # 초기화는 최초 1회만
+
+st.session_state.messages.append({...})  # 이후 재실행에도 유지
+```
+
+### SSE 스트리밍 수신
+
+`requests`의 `stream=True`로 SSE를 한 줄씩 읽어서 `st.write_stream`에 제너레이터로 전달.
+
+```python
+def token_stream():
+    with requests.post(url, json={...}, stream=True) as resp:
+        for line in resp.iter_lines():
+            if line.startswith(b"data: "):
+                event = json.loads(line[6:])
+                if event["type"] == "token":
+                    yield event["data"]          # 토큰만 yield → 화면에 타이핑 효과
+                elif event["type"] == "sources":
+                    state["sources"] = event["data"]   # 부수 효과로 캡처
+                elif event["type"] == "done":
+                    state["session_id"] = event["session_id"]
+
+answer = st.write_stream(token_stream())  # 스트림 소비하며 화면에 출력, 완성된 문자열 반환
+```
+
+- `state` dict를 통해 sources / session_id를 제너레이터 바깥으로 꺼냄
+- `st.write_stream`은 제너레이터가 끝나면 전체 텍스트를 반환
+
+---
+
+## 15. CORS
+
+### 개념
+
+브라우저가 **다른 origin(프로토콜 + 도메인 + 포트)** 의 서버에 JS로 요청을 보낼 때 적용되는 보안 정책.
+
+```
+http://localhost:8501  (Streamlit)
+http://localhost:8000  (FastAPI)
+→ 포트만 달라도 다른 origin
+```
+
+### 브라우저 vs curl
+
+| | curl | 브라우저 JS |
+|---|---|---|
+| 출처 검사 | 없음 | 있음 (CORS) |
+| preflight 요청 | 없음 | 조건부로 OPTIONS 먼저 전송 |
+| 응답 차단 | 없음 | 서버가 허용 안 하면 차단 |
+
+CORS는 **브라우저가 강제**하는 정책 — 서버가 아님. curl로는 항상 뚫리므로 CORS를 보안 수단으로 쓰면 안 됨. 실제 API 보안은 인증 토큰으로 해야 함.
+
+### 동작 방식
+
+브라우저가 요청 전에 `OPTIONS` preflight를 먼저 보내서 서버가 허용하는지 확인.
+
+```
+JS → OPTIONS /query (preflight)
+          ↓
+FastAPI → Access-Control-Allow-Origin: http://localhost:8501
+          ↓
+브라우저 → 허용 확인 → 실제 POST 전송
+```
+
+### FastAPI 설정
+
+```python
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,  # ["http://localhost:8501"]
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+```
+
+### 이 프로젝트에서
+
+Streamlit 서버(Python)가 FastAPI를 직접 호출하므로 엄밀히는 CORS 불필요. 브라우저 기반 클라이언트(React 등)를 붙일 때 필수.
+
+---
+
 ## Q&A / 메모
 
 <!-- 공부하면서 생긴 질문이나 메모를 여기 기록 -->
