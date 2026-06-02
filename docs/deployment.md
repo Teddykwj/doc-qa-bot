@@ -4,16 +4,15 @@
 
 ```
 인터넷
-  │ 80
- ALB (퍼블릭 서브넷 A/B)
-  │ 8000
- ECS Fargate - FastAPI (퍼블릭 서브넷)
-  │  └── EFS 마운트 → /app/data (ChromaDB 영구 저장)
-  │ 11434
- EC2 t3.micro - Ollama + tinyllama (퍼블릭 서브넷)
+  ├── :80   → ALB → ECS:8000  (FastAPI)
+  └── :8501 → ALB → ECS:8501  (Streamlit UI)
+                      │
+               EFS 마운트 → /app/data (ChromaDB 영구 저장)
+                      │ :11434
+               EC2 t3.micro - Ollama + tinyllama
 ```
 
-**무중단 배포 원리**: 코드 push → GitHub Actions → 새 이미지 ECR 푸시 → ECS 롤링 업데이트 → `/health` 통과 후 구 태스크 종료.
+**무중단 배포 원리**: 코드 push → GitHub Actions → API/UI 이미지 ECR 푸시 → ECS 롤링 업데이트 → 헬스체크 통과 후 구 태스크 종료.
 
 ---
 
@@ -25,12 +24,14 @@
 | 퍼블릭 서브넷 | 2개 | ap-northeast-2a/b |
 | 보안그룹 | `sg-alb`, `sg-api`, `sg-ollama` | 체인 방식 |
 | EC2 | `doc-qa-ollama` | t3.micro, Ubuntu 24.04 |
-| ECR | `doc-qa-api` | Private |
+| ECR | `doc-qa-api` | FastAPI 이미지 |
+| ECR | `doc-qa-streamlit` | Streamlit 이미지 |
 | EFS | `doc-qa-chroma` | ChromaDB 저장 |
-| ALB | `doc-qa-alb` | HTTP:80 |
-| 타겟그룹 | `doc-qa-tg` | HTTP:8000, /health 체크 |
+| ALB | `doc-qa-alb` | HTTP:80 (API), HTTP:8501 (UI) |
+| 타겟그룹 | `doc-qa-tg` | HTTP:8000, `/health` 체크 |
+| 타겟그룹 | `doc-qa-tg-ui` | HTTP:8501, `/_stcore/health` 체크 |
 | ECS 클러스터 | `doc-qa-cluster` | Fargate |
-| ECS 태스크 | `doc-qa-task` | 0.25 vCPU / 0.5GB |
+| ECS 태스크 | `doc-qa-task` | 0.25 vCPU / 0.5GB, 컨테이너 2개 |
 | ECS 서비스 | `doc-qa-service` | desired: 1 |
 | IAM | `github-actions-deploy` | ECR + ECS 권한 |
 
@@ -73,11 +74,13 @@ NAT 없으므로 ECS, EC2 모두 퍼블릭 서브넷에 배치. 접근 제어는
 | 포트 | 소스 |
 |---|---|
 | 80, 443 | `0.0.0.0/0` |
+| 8501 | `0.0.0.0/0` |
 
-**sg-api** (FastAPI ECS용)
+**sg-api** (FastAPI + Streamlit ECS용)
 | 포트 | 소스 |
 |---|---|
 | 8000 | `sg-alb` |
+| 8501 | `sg-alb` |
 | 2049 (NFS) | `sg-api` (자기 자신) ← EFS 마운트용 |
 
 **sg-ollama** (Ollama EC2용)
@@ -130,7 +133,9 @@ ollama pull nomic-embed-text
 
 ### 5단계: ECR 리포지토리 생성
 
-ECR → Create repository → Private → 이름: `doc-qa-api`
+ECR → Create repository → Private로 2개 생성:
+- `doc-qa-api` (FastAPI)
+- `doc-qa-streamlit` (Streamlit UI)
 
 GitHub Actions가 이미지를 빌드해서 올리므로 로컬 AWS CLI 불필요.
 
@@ -151,14 +156,21 @@ EFS → Create file system → Customize
 
 ### 7단계: ALB + 타겟 그룹 생성
 
-타겟 그룹 먼저 생성:
+타겟 그룹 2개 먼저 생성:
 
+**doc-qa-tg** (FastAPI용)
 | 항목 | 값 |
 |---|---|
 | Target type | IP addresses |
-| 이름 | `doc-qa-tg` |
 | Port | 8000 |
 | Health check path | `/health` |
+
+**doc-qa-tg-ui** (Streamlit용)
+| 항목 | 값 |
+|---|---|
+| Target type | IP addresses |
+| Port | 8501 |
+| Health check path | `/_stcore/health` |
 
 ALB 생성:
 
@@ -169,7 +181,8 @@ ALB 생성:
 | VPC | `doc-qa-vpc` |
 | Subnets | 퍼블릭 서브넷 2개 |
 | 보안그룹 | `sg-alb` |
-| Listener | HTTP:80 → `doc-qa-tg` |
+| Listener 1 | HTTP:80 → `doc-qa-tg` |
+| Listener 2 | HTTP:8501 → `doc-qa-tg-ui` |
 
 ---
 
@@ -185,16 +198,26 @@ aws iam create-service-linked-role --aws-service-name ecs.amazonaws.com
 
 **태스크 정의** (`doc-qa-task`):
 
+컨테이너 1 - FastAPI:
 | 항목 | 값 |
 |---|---|
 | Launch type | Fargate |
 | CPU / Memory | 0.25 vCPU / 0.5GB |
-| 이미지 | ECR URI |
+| 이미지 | `doc-qa-api` ECR URI |
 | 포트 | 8000 |
 | 환경변수 | `OLLAMA_BASE_URL=http://<EC2 프라이빗 IP>:11434` |
 | 환경변수 | `LLM_MODEL=tinyllama` |
 | 환경변수 | `EMBEDDING_MODEL=nomic-embed-text` |
 | Volume | EFS `doc-qa-chroma` → `/app/data` |
+
+컨테이너 2 - Streamlit:
+| 항목 | 값 |
+|---|---|
+| 이미지 | `doc-qa-streamlit` ECR URI |
+| 포트 | 8501 |
+| 환경변수 | `API_BASE_URL=http://localhost:8000` |
+
+> 같은 태스크 내 컨테이너끼리는 localhost로 통신.
 
 **서비스** (`doc-qa-service`):
 
@@ -205,7 +228,8 @@ aws iam create-service-linked-role --aws-service-name ecs.amazonaws.com
 | 서브넷 | 퍼블릭 서브넷 2개 |
 | Public IP | Enabled (ECR pull용) |
 | 보안그룹 | `sg-api` |
-| Load balancer | `doc-qa-alb` → `doc-qa-tg` |
+| Load balancer 1 | `doc-qa-alb` → `doc-qa-api:8000` → `doc-qa-tg` |
+| Load balancer 2 | `doc-qa-alb` → `doc-qa-streamlit:8501` → `doc-qa-tg-ui` |
 
 ---
 
@@ -332,10 +356,20 @@ aws ec2 describe-instances \
   --query "Reservations[0].Instances[0].State.Name" \
   --output text
 
+# ECS 실행 중인 태스크 수
+aws ecs describe-services \
+  --cluster doc-qa-cluster \
+  --services doc-qa-service \
+  --query "services[0].runningCount" \
+  --output text
+
 # ALB 존재 여부
 aws elbv2 describe-load-balancers --names doc-qa-alb \
   --query "LoadBalancers[0].State.Code" --output text 2>&1
 
 # API 헬스체크
 curl http://<ALB DNS>/health
+
+# Streamlit 헬스체크
+curl http://<ALB DNS>:8501/_stcore/health
 ```
