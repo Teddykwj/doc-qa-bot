@@ -3,15 +3,23 @@ name: Deploy to ECS
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - 'scripts/**'
+      - 'tests/**'
+      - '*.md'
+      - '.gitignore'
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
   ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
   ECR_REPOSITORY: doc-qa-api
+  ECR_REPOSITORY_UI: doc-qa-streamlit
   ECS_CLUSTER: doc-qa-cluster
   ECS_SERVICE: doc-qa-service
   TASK_DEFINITION: doc-qa-task
   CONTAINER_NAME: doc-qa-api
+  CONTAINER_NAME_UI: doc-qa-streamlit
 
 jobs:
   deploy:
@@ -32,11 +40,19 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Docker 이미지 빌드 & ECR 푸시
-        id: build-image
+      - name: API 이미지 빌드 & ECR 푸시
+        id: build-api
         run: |
           IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
           docker build -f docker/Dockerfile -t $IMAGE_URI .
+          docker push $IMAGE_URI
+          echo "image=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+      - name: Streamlit 이미지 빌드 & ECR 푸시
+        id: build-ui
+        run: |
+          IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY_UI:${{ github.sha }}
+          docker build -f docker/Dockerfile.streamlit -t $IMAGE_URI .
           docker push $IMAGE_URI
           echo "image=$IMAGE_URI" >> $GITHUB_OUTPUT
 
@@ -46,18 +62,26 @@ jobs:
             --task-definition $TASK_DEFINITION \
             --query taskDefinition > task-definition.json
 
-      - name: 태스크 정의에 새 이미지 반영
-        id: task-def
+      - name: 태스크 정의에 API 이미지 반영
+        id: task-def-api
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
           task-definition: task-definition.json
           container-name: ${{ env.CONTAINER_NAME }}
-          image: ${{ steps.build-image.outputs.image }}
+          image: ${{ steps.build-api.outputs.image }}
+
+      - name: 태스크 정의에 Streamlit 이미지 반영
+        id: task-def-ui
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def-api.outputs.task-definition }}
+          container-name: ${{ env.CONTAINER_NAME_UI }}
+          image: ${{ steps.build-ui.outputs.image }}
 
       - name: ECS 서비스 배포
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
-          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          task-definition: ${{ steps.task-def-ui.outputs.task-definition }}
           service: ${{ env.ECS_SERVICE }}
           cluster: ${{ env.ECS_CLUSTER }}
           wait-for-service-stability: true
