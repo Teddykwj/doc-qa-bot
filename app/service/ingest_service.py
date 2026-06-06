@@ -37,9 +37,17 @@ class IngestService:
             if not chunks:
                 raise IngestError(f"No documents found in: {source}")
 
-            ids = [_chunk_id(c.metadata.get("source", ""), c.page_content) for c in chunks]
-            existing = set(self._vectorstore._collection.get(ids=ids)["ids"])
-            new_pairs = [(chunk, id_) for chunk, id_ in zip(chunks, ids) if id_ not in existing]
+            # 중복 ID 제거 (동일 내용 청크)
+            seen: dict[str, int] = {}
+            for i, chunk in enumerate(chunks):
+                id_ = _chunk_id(chunk.metadata.get("source", ""), chunk.page_content)
+                if id_ not in seen:
+                    seen[id_] = i
+            unique_pairs = [(chunks[i], id_) for id_, i in seen.items()]
+
+            unique_ids = [id_ for _, id_ in unique_pairs]
+            existing = set(self._vectorstore._collection.get(ids=unique_ids)["ids"])
+            new_pairs = [(chunk, id_) for chunk, id_ in unique_pairs if id_ not in existing]
 
             if new_pairs:
                 new_chunks, new_ids = zip(*new_pairs)
