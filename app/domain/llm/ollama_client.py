@@ -1,11 +1,11 @@
-from langchain_ollama import OllamaLLM
+from langchain_anthropic import ChatAnthropic
 
 from config.settings import settings
 
 
 def get_llm(model: str | None = None):
-    return OllamaLLM(
+    return ChatAnthropic(
         model=model or settings.llm_model,
-        base_url=settings.ollama_base_url,
+        api_key=settings.anthropic_api_key,
         temperature=settings.llm_temperature,
     )
